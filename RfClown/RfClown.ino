@@ -5,6 +5,7 @@
    
 #include "setting.h"
 #include "config.h"
+#include "menu_logic.h"     // tested navigation + status rules (test_menu_logic)
 #include <esp_task_wdt.h>   // FREEZE FIX (2026-11-19) — see setup()
 
 void IRAM_ATTR handleButton() {
@@ -182,6 +183,12 @@ static void drawHeaderBar() {
   u8g2.setFont(FONT_SMALL);
   u8g2.setDrawColor(0);
   u8g2.drawStr(PAD, TXT_Y, "RF-Clown");
+  // ARMED MARKER (2026-11-19): a solid dot at the top-left of the header
+  // whenever the device is transmitting, visible from ANY card — belt and
+  // suspenders with the per-card truth fix above.
+  u8g2.setDrawColor(1);
+  if (current == ACTIVE_MODE) u8g2.drawDisc(3, HEADER_H / 2, 2);
+  u8g2.setDrawColor(0);
   const char* ver = "v2.0.0";
   int vw = u8g2.getStrWidth(ver);
   u8g2.drawStr(W - vw - 4, TXT_Y, ver);
@@ -254,9 +261,13 @@ static void drawCardAtCenter(int centerX, int menuIndex){
     status = ledEnabled ? "ON" : "OFF";
     isOn   = ledEnabled;
   } else {
-    bool isActive = (isThisFocus && current == ACTIVE_MODE);
-    status = isActive ? "JAMMING" : "PASSIVE";
-    isOn   = isActive;
+    // FROZEN TARGET (test-driven cycle 2, 2026-11-19): only the armed
+    // TARGET's card shows JAMMING — every other card truthfully shows
+    // PASSIVE, because browsing never retargets the transmitter. Verified
+    // by test_menu_logic ("armed on WiFi: Zigbee card shows PASSIVE").
+    bool deviceArmed = (current == ACTIVE_MODE);
+    status = menu::statusForCard(deviceArmed, menuIndex, menuIndexFromMode(armedMode));
+    isOn   = deviceArmed && (cardMode == armedMode);
   }
   u8g2.setFont(FONT_SMALL);
   u8g2.setCursor(x + 12, y + 16);
@@ -419,16 +430,18 @@ void menuToggleActive() {
 }
 
 void checkMode() {
-  // UX FIX (2026-11-19): direction was inverted — the right-hand button
-  // stepped to the PREVIOUS mode and the left-hand button stepped forward.
-  // Swapped so the controls read the way every other carousel does:
-  // left = back, right = forward. (Wrap updated for the 10-card menu.)
+  // NAVIGATION (test-driven fix 2026-11-19): LEFT button (GPIO27) goes
+  // BACK, RIGHT button (GPIO25) ADVANCES — verified on-device by the
+  // test_menu_logic sketch (11/11 PASS). An earlier "fix" this same day
+  // had this backwards: it misread a complaint about the slide ANIMATION
+  // direction as a complaint about selection direction. The rules now
+  // live in menu_logic.h, unit-tested against the hardware.
   if (ChangeRequested) {
     ChangeRequested = false;
-    current_Mode = static_cast<OperationMode>((current_Mode + 1) % 10);
+    current_Mode = modeFromMenuIndex(menu::prevIndex(menuIndexFromMode(current_Mode)));
   } else if (ChangeRequested1) {
     ChangeRequested1 = false;
-    current_Mode = static_cast<OperationMode>((current_Mode == 0) ? 9 : (current_Mode - 1));
+    current_Mode = modeFromMenuIndex(menu::nextIndex(menuIndexFromMode(current_Mode)));
   }
   // Remember the last REAL jamming mode, so the Screensaver and LED settings
   // cards can keep it running while focus sits on them.
@@ -528,6 +541,11 @@ void loop() {
       return;
     }
     if (current != lastActivity) {
+      // FROZEN TARGET (test-driven cycle 2, 2026-11-19): capture WHICH mode
+      // is being armed, at the moment of arming. From here on the radios
+      // hop this mode's channels no matter where the user browses —
+      // navigating a live transmitter used to silently retarget it.
+      if (current == ACTIVE_MODE) armedMode = current_Mode;
       // ORDER FIX (2026-11-19): draw the toggle animation BEFORE arming the
       // radios. The interrupt flips the armed flag instantly, and arming used
       // to run before any drawing — so when the battery rail dipped and the
@@ -558,11 +576,18 @@ void loop() {
   }
 
   // ---- Channel hopping (radios only emit if jamming is armed) ----
-  // On the Screensaver/LED cards, keep the LAST real mode running.
-  OperationMode jamMode =
-      (current_Mode == SCREENSAVER_MODULE || current_Mode == LED_MODULE)
-          ? lastJamMode : current_Mode;
-  byte channel = randomChannelFor(jamMode);
+  // FROZEN TARGET: while armed, hop the mode captured at arm time — never
+  // the card the user happens to be browsing. On settings cards while
+  // passive, hop the last real mode (harmless; radios are powered down).
+  OperationMode hopMode;
+  if (current == ACTIVE_MODE) {
+    hopMode = armedMode;
+  } else if (current_Mode == SCREENSAVER_MODULE || current_Mode == LED_MODULE) {
+    hopMode = lastJamMode;
+  } else {
+    hopMode = current_Mode;
+  }
+  byte channel = randomChannelFor(hopMode);
   RadioA.setChannel(channel);
   RadioB.setChannel(channel);
   RadioC.setChannel(channel);

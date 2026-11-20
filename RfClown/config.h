@@ -120,6 +120,9 @@ extern volatile bool wakeRequested;       // set by any center press while anima
 extern volatile bool toggleLedRequested;  // set by center press on LED card
 extern OperationMode lastJamMode;         // last REAL jamming mode focused — the
                                           // Screensaver/LED cards keep it running
+extern OperationMode armedMode;           // FROZEN TARGET: the mode focused at the
+                                          // moment jamming was switched on. Browsing
+                                          // never retargets a live transmitter.
 extern bool ledEnabled;                   // user's LED preference (persisted EEPROM)
 
 extern unsigned long lastPressTime;

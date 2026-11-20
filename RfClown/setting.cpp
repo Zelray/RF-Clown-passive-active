@@ -41,6 +41,7 @@ volatile bool enterScreensaver   = false;
 volatile bool wakeRequested      = false;
 volatile bool toggleLedRequested = false;
 OperationMode lastJamMode        = WiFi_MODULE;
+OperationMode armedMode          = WiFi_MODULE;  // frozen jam target (see config.h)
 bool ledEnabled                  = true;
 
 unsigned long lastPressTime = 0;  // for debouncing the buttons

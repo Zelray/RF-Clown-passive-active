@@ -3,3 +3,7 @@
 
 # Local test evidence logs (kept on disk, kept out of the repo)
 jam-test-*.txt
+
+# Personal working docs (session handoffs — not part of the public fork)
+HANDOFF.md
+STATUS.md

@@ -158,3 +158,20 @@ firmware regressions:
    collapsed (hardware limit; document in the issue as errata).
 3. Power-off remains battery-pull-only (hardware errata above).
 
+---
+
+# Round 4 — battery test results (2026-11-19 late)
+
+With rounds 1-3 installed, on battery (untethered):
+- Boot: clean. Navigation: works. **WiFi jamming: WORKS** — arming survives
+  (quiet start + staggered arming carried the rail). This resolves the
+  "freezes at boot / freezes on activate" class for the transmit path.
+- REMAINING BUG: while armed on battery, the menu locks (nav buttons stop
+  responding; no watchdog reboot observed, so the main loop stays alive and
+  button presses are being lost rather than the firmware hanging). On USB,
+  menus keep scrolling while armed. Working hypotheses + diagnostic plan
+  (data-only USB cable to get serial during battery operation; per-button
+  debounce timestamps) tracked in the working session handoff.
+- LED: shows status on USB; completely dark on battery (rail likely below
+  the WS2812 minimum). The v1->v2 init regression fix stands regardless.
+

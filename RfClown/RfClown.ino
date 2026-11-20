@@ -8,6 +8,46 @@
 #include "menu_logic.h"     // tested navigation + status rules (test_menu_logic)
 #include <esp_task_wdt.h>   // FREEZE FIX (2026-11-19) — see setup()
 
+// DIAG (2026-11-20, battery UI-lock hunt, round 2): the heartbeat proved the
+// loop and screen stay ALIVE during the battery-armed lock — only the button
+// input dies. Leading theory: RF interference HOLDS a button line low, so a
+// real press never creates a high->low transition and no interrupt ever
+// fires (the firmware literally never hears the press). These counters make
+// the input path visible ON SCREEN (see drawDiagLine, bottom menu line):
+//   diagEdgesX  = how many interrupts (falling edges) button X has delivered
+//   diagAccX    = how many of those passed the accept() rule
+// Declared up here (before the ISRs) because the Arduino build auto-generates
+// function prototypes near the top of the file — the ISRs must see these.
+static volatile unsigned int diagEdgesL = 0;  // LEFT   (GPIO27) falling edges
+static volatile unsigned int diagEdgesC = 0;  // CENTER (GPIO26) falling edges
+static volatile unsigned int diagEdgesR = 0;  // RIGHT  (GPIO25) falling edges
+static volatile unsigned int diagAccL   = 0;  // LEFT   accepted presses
+static volatile unsigned int diagAccC   = 0;  // CENTER accepted presses
+static volatile unsigned int diagAccR   = 0;  // RIGHT  accepted presses
+
+// DIAG round 3 (2026-11-20): owner's battery test readout — during the lock
+// the lines show RELEASED (squares hollow), presses produce ZERO falling
+// edges, yet the loop and screen stay alive. Two suspects left:
+//   (a) the interrupt machinery itself dies under radio load  -> routable
+//       around in software (poll the pins from the main loop), or
+//   (b) the lines never reach the chip as LOW when pressed (ground bounce
+//       from the radios' return currents) -> hardware fix.
+// The polled path below settles it AND, if (a) is true, IS the fix: the
+// buttons come back to life with no soldering. Both paths share the same
+// per-button debounce clocks, so the 250 ms window itself dedupes a single
+// physical press that both paths see.
+//   diagPollX  = presses accepted via the POLLED path (screen: "P" counts)
+//   latchX     = line was observed LOW at any instant since the last screen
+//                refresh — so even a 100 ms press leaves a visible square.
+//                (Plain bools, not volatile: written by pollButtons() and
+//                cleared by drawDiagLine(), both main-loop context.)
+static volatile unsigned int diagPollL  = 0;  // LEFT   accepted via polling
+static volatile unsigned int diagPollC  = 0;  // CENTER accepted via polling
+static volatile unsigned int diagPollR  = 0;  // RIGHT  accepted via polling
+static bool diagLatchL = false;               // LEFT   line seen LOW since last refresh
+static bool diagLatchC = false;               // CENTER line seen LOW since last refresh
+static bool diagLatchR = false;               // RIGHT  line seen LOW since last refresh
+
 // BUTTON FIX (2026-11-19, battery UI-lock bug): each handler now uses
 // (a) its OWN debounce clock — they used to share one, and RF noise from
 // the transmitting radios kept that shared clock permanently fresh, so
@@ -19,35 +59,54 @@
 // The acceptance rule itself lives in menu_logic.h (namespace btn) and is
 // covered by the on-device test suite.
 void IRAM_ATTR handleButton() {
+  diagEdgesL++;  // DIAG: count EVERY falling edge, accepted or not
   if (btn::accept(millis(), lastPressL, debounceDelay, digitalRead(PIN_BTN_L) == LOW)) {
     ChangeRequested = true;
+    diagAccL++;
   }
 }
 
 void IRAM_ATTR handleButton1() {
+  diagEdgesR++;  // DIAG: count EVERY falling edge, accepted or not
   if (btn::accept(millis(), lastPressR, debounceDelay, digitalRead(PIN_BTN_R) == LOW)) {
     ChangeRequested1 = true;
+    diagAccR++;
+  }
+}
+
+// CENTER-BUTTON ACTION (2026-11-19, shared by BOTH input paths since
+// 2026-11-20): what a center press DOES, kept in one place so the interrupt
+// path and the polled path can never drift apart.
+// IRAM_ATTR (2026-11-20, code-review catch): this runs from an interrupt,
+// so it must live in internal RAM. It used to sit in flash, and during the
+// few-ms windows when EEPROM.commit() has the flash cache disabled (i.e.
+// right after an LED-card toggle), a center press would have faulted and
+// REBOOTED the board — a failure that mimics the battery brownout symptom.
+// Its body only touches DRAM flags/enums, so IRAM placement is safe.
+static void IRAM_ATTR centerButtonAction() {
+  // FEATURE (2026-11-19): the center button is now context-aware:
+  //   - while the screensaver is showing -> any press WAKES it
+  //   - on the Screensaver card          -> press STARTS the animation
+  //   - on the LED card                  -> press toggles the LED on/off
+  //   - on any jamming card              -> press arms/disarms as before
+  if (screensaverActive) {
+    wakeRequested = true;
+  } else if (current_Mode == SCREENSAVER_MODULE) {
+    enterScreensaver = true;
+  } else if (current_Mode == LED_MODULE) {
+    toggleLedRequested = true;
+  } else if (current == DEACTIVE_MODE) {
+    current = ACTIVE_MODE;
+  } else {
+    current = DEACTIVE_MODE;
   }
 }
 
 void IRAM_ATTR handleButton2() {
+  diagEdgesC++;  // DIAG: count EVERY falling edge, accepted or not
   if (btn::accept(millis(), lastPressS, debounceDelay, digitalRead(PIN_BTN_S) == LOW)) {
-    // FEATURE (2026-11-19): the center button is now context-aware:
-    //   - while the screensaver is showing -> any press WAKES it
-    //   - on the Screensaver card          -> press STARTS the animation
-    //   - on the LED card                  -> press toggles the LED on/off
-    //   - on any jamming card              -> press arms/disarms as before
-    if (screensaverActive) {
-      wakeRequested = true;
-    } else if (current_Mode == SCREENSAVER_MODULE) {
-      enterScreensaver = true;
-    } else if (current_Mode == LED_MODULE) {
-      toggleLedRequested = true;
-    } else if (current == DEACTIVE_MODE) {
-      current = ACTIVE_MODE;
-    } else {
-      current = DEACTIVE_MODE;
-    }
+    centerButtonAction();
+    diagAccC++;
   }
 }
 
@@ -56,7 +115,8 @@ void configure_Radio(RF24 &radio, const byte *channels, size_t size) {
   radio.printPrettyDetails();
   for (size_t i = 0; i < size; i++) {
     radio.setChannel(channels[i]);
-    radio.startConstCarrier(RF24_PA_MAX, channels[i]);
+    // TX POWER EXPERIMENT (2026-11-20): PA_MAX -> RF_PA_LEVEL (see config.h)
+    radio.startConstCarrier(RF_PA_LEVEL, channels[i]);
   }
 }
 
@@ -249,6 +309,48 @@ static void drawPaginationDots(int active){
   }
 }
 
+// DIAG (2026-11-20, round 3): bottom line comparing the TWO input paths
+// side by side: "E 3/0/12 P 3/0/0" plus three latched squares.
+//   E = falling edges the INTERRUPT path heard   (L/C/R order)
+//   P = presses the POLLED path accepted         (L/C/R order)
+//   squares (right edge, L-C-R): FILLED = the line was seen LOW at any
+//   instant since the last screen refresh (1 s ago) — i.e. a press (or
+//   noise) DID electrically reach the pin. Latched so a 100 ms press is
+//   still visible; cleared after each redraw.
+// How to read it during the battery lock, pressing slowly:
+//   - P climbs + menu moves        -> interrupt machinery was dead; the
+//     polled path IS the fix. Device works on battery again. Done.
+//   - P frozen + squares never fill -> the press never reaches the pin as
+//     LOW: electrical (ground bounce) -> hardware fix, no software answer.
+//   - squares fill but P frozen    -> line dips low too briefly/weakly for
+//     even the poll to catch (marginal levels) -> still electrical.
+static void drawDiagLine() {
+  // Snapshot the volatile counters with interrupts off so the numbers
+  // are self-consistent (a torn read could show impossible combos).
+  noInterrupts();
+  unsigned int eL = diagEdgesL, eC = diagEdgesC, eR = diagEdgesR;
+  unsigned int pL = diagPollL,  pC = diagPollC,  pR = diagPollR;
+  bool latL = diagLatchL, latC = diagLatchC, latR = diagLatchR;
+  diagLatchL = false; diagLatchC = false; diagLatchR = false;
+  interrupts();
+  // Cap display at 99 so the line can never overflow the screen width.
+  // (No space between the E and P groups: 19 chars x 6 px would otherwise
+  // run into the latch squares at x=112 — code-review overlap catch.)
+  char buf[26];
+  snprintf(buf, sizeof(buf), "E%02u/%02u/%02uP%02u/%02u/%02u",
+           eL % 100u, eC % 100u, eR % 100u, pL % 100u, pC % 100u, pR % 100u);
+  u8g2.setFont(FONT_SMALL);
+  u8g2.setDrawColor(1);
+  u8g2.drawStr(1, 56, buf);   // FONT_SMALL is 8px tall: rows 56-63, fits
+  // Latched "line went LOW" squares, L-C-R order, right edge of same row.
+  const uint8_t sqX[3] = {112, 118, 124};
+  const bool  lat[3]   = { latL, latC, latR };
+  for (int i = 0; i < 3; i++) {
+    if (lat[i]) u8g2.drawBox(sqX[i], 57, 4, 4);    // press reached the pin
+    else        u8g2.drawFrame(sqX[i], 57, 4, 4);  // nothing seen since last refresh
+  }
+}
+
 static void drawCardAtCenter(int centerX, int menuIndex){
   const char* label = kMenuLabels[menuIndex];
   const int W = 128;
@@ -296,7 +398,10 @@ static void renderStaticMenu(int focusIndex) {
   u8g2.clearBuffer();
   drawHeaderBar();
   drawCardAtCenter(128 / 2, focusIndex);
-  drawPaginationDots(focusIndex);
+  // DIAG BUILD (2026-11-20): pagination dots swapped for the button
+  // diagnostic line while hunting the battery UI-lock. Restore the dots
+  // (and delete drawDiagLine + counters) once the root cause is known.
+  drawDiagLine();
   u8g2.sendBuffer();
 }
 
@@ -465,6 +570,50 @@ void checkMode() {
   }
 }
 
+// POLLED INPUT PATH (2026-11-20, round 3): the interrupt path goes silent
+// during the battery-armed lock (zero falling edges while the loop and
+// screen provably run). This function reads all three button lines DIRECTLY
+// on every pass of the main loop — thousands of times a second — and runs
+// the exact same accept() rule on each high->low transition it sees.
+//   - If the interrupt MACHINERY is what dies under radio load, this path
+//     keeps the buttons alive -> the device works on battery again, in
+//     software, no soldering.
+//   - If this path ALSO sees nothing while the owner presses, the press is
+//     not electrically reaching the pin (ground bounce) -> hardware fix.
+// Both paths share each button's debounce clock, so one physical press can
+// only be accepted once no matter which path sees it first. The atomic
+// (noInterrupts-wrapped) accept() calls keep the ISR from tearing a poll.
+static void pollButtons() {
+  static bool prevL = HIGH, prevC = HIGH, prevR = HIGH;  // levels last pass
+  bool l = digitalRead(PIN_BTN_L);
+  bool c = digitalRead(PIN_BTN_S);
+  bool r = digitalRead(PIN_BTN_R);
+  // Latch any instant a line sits LOW — feeds the on-screen squares
+  // (drawDiagLine clears them once per refresh).
+  if (l == LOW) diagLatchL = true;
+  if (c == LOW) diagLatchC = true;
+  if (r == LOW) diagLatchR = true;
+  if (prevL == HIGH && l == LOW) {           // software falling edge, LEFT
+    noInterrupts();
+    bool ok = btn::accept(millis(), lastPressL, debounceDelay, true);
+    interrupts();
+    if (ok) { ChangeRequested = true; diagPollL++; }
+  }
+  if (prevR == HIGH && r == LOW) {           // software falling edge, RIGHT
+    noInterrupts();
+    bool ok = btn::accept(millis(), lastPressR, debounceDelay, true);
+    interrupts();
+    if (ok) { ChangeRequested1 = true; diagPollR++; }
+  }
+  if (prevC == HIGH && c == LOW) {           // software falling edge, CENTER
+    noInterrupts();
+    bool ok = btn::accept(millis(), lastPressS, debounceDelay, true);
+    interrupts();
+    if (ok) { centerButtonAction(); diagPollC++; }
+  }
+  prevL = l; prevC = c; prevR = r;
+}
+
 void setup() {
   Serial.begin(115200);
   // BATTERY FIX (2026-11-19): setup() used to fire ALL THREE radios into
@@ -514,6 +663,7 @@ void setup() {
 
 void loop() {
   esp_task_wdt_reset();   // "still alive" pat for the 10 s watchdog
+  pollButtons();          // DIAG round 3: independent polled button path
   checkMode();
 
   // ---- Settings-card actions (flags come from the center-button ISR) ----
@@ -589,6 +739,8 @@ void loop() {
     heartbeatOn = !heartbeatOn;
     renderStaticMenu(menuIndexFromMode(current_Mode));
     // One-line status dump: for future data-only-cable debugging sessions.
+    // DIAG (2026-11-20): extended with button edges/accepted counters and
+    // live pin levels (1 = line LOW = "pressed" level).
     Serial.print("HB ms=");
     Serial.print(lastHeartbeatMs);
     Serial.print(" armed=");
@@ -597,6 +749,22 @@ void loop() {
     Serial.print(menuIndexFromMode(current_Mode));
     Serial.print(" target=");
     Serial.println(menuIndexFromMode(armedMode));
+    Serial.print("   E L/C/R=");
+    Serial.print(diagEdgesL); Serial.print("/");
+    Serial.print(diagEdgesC); Serial.print("/");
+    Serial.print(diagEdgesR);
+    Serial.print(" A L/C/R=");
+    Serial.print(diagAccL); Serial.print("/");
+    Serial.print(diagAccC); Serial.print("/");
+    Serial.print(diagAccR);
+    Serial.print(" P L/C/R=");
+    Serial.print(diagPollL); Serial.print("/");
+    Serial.print(diagPollC); Serial.print("/");
+    Serial.print(diagPollR);
+    Serial.print(" pins L/C/R=");
+    Serial.print(digitalRead(PIN_BTN_L) == LOW ? 1 : 0);
+    Serial.print(digitalRead(PIN_BTN_S) == LOW ? 1 : 0);
+    Serial.println(digitalRead(PIN_BTN_R) == LOW ? 1 : 0);
   }
 
   // ---- Status LED (2026-11-19): green while jamming, blue while passive,

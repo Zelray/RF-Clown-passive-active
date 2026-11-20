@@ -93,7 +93,9 @@ void configureNrf(RF24 &radio) {
   radio.setAutoAck(false);
   radio.stopListening();
   radio.setRetries(0, 0);
-  radio.setPALevel(RF24_PA_MAX, true);
+  // TX POWER EXPERIMENT (2026-11-20): PA_MAX -> RF_PA_LEVEL (PA_LOW for the
+  // battery-rail test — see config.h). Revert when the experiment concludes.
+  radio.setPALevel(RF_PA_LEVEL, true);
   radio.setDataRate(RF24_2MBPS);
   radio.setCRCLength(RF24_CRC_DISABLED);
 }

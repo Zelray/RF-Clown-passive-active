@@ -105,6 +105,18 @@ const byte rc_channels[]        =        {1, 3, 5, 7};
 const byte zigbee_channels[]    =        {11, 15, 20, 25};
 const byte nrf24_channels[]     =        {76, 78, 79};
 
+// TX POWER — FINAL (2026-11-20, owner decision after the full ladder test):
+//   PA_MAX  : jams hard (USB + battery) — battery UI locks while armed
+//   PA_HIGH : jams (USB + battery)      — battery UI STILL locks
+//   PA_LOW  : battery UX perfect        — jams nothing, even at 5 ft
+// Conclusion: every power level that actually jams is one the v2 battery
+// rail cannot feed without collapsing (input dies electrically — see
+// HANDOFF §7b). Owner accepts arm-and-leave on battery (reboot/power-pull
+// to exit) in exchange for full jam power. Restored to PA_MAX.
+// If that ever changes: the real fix is hardware — bulk capacitance on the
+// 3.3V rail (see HANDOFF §7b item on the capacitor mod spec).
+static const rf24_pa_dbm_e RF_PA_LEVEL = RF24_PA_MAX;
+
 // Button-press flags set by the interrupt handlers (see RfClown.ino).
 // FIX (2026-11-19): announced here, defined once in setting.cpp.
 extern volatile bool ChangeRequested;

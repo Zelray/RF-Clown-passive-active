@@ -8,25 +8,30 @@
 #include "menu_logic.h"     // tested navigation + status rules (test_menu_logic)
 #include <esp_task_wdt.h>   // FREEZE FIX (2026-11-19) — see setup()
 
+// BUTTON FIX (2026-11-19, battery UI-lock bug): each handler now uses
+// (a) its OWN debounce clock — they used to share one, and RF noise from
+// the transmitting radios kept that shared clock permanently fresh, so
+// every REAL press was rejected as "too soon" (all buttons dead on battery
+// until power-pull; no watchdog reboot because the code never hangs), and
+// (b) a "still held down" check — the pin must still read LOW when the
+// handler runs. A finger holds the line down for 100+ ms; an RF-induced
+// ghost spike is over in microseconds, so ghosts reject themselves.
+// The acceptance rule itself lives in menu_logic.h (namespace btn) and is
+// covered by the on-device test suite.
 void IRAM_ATTR handleButton() {
-  unsigned long currentTime = millis();
-  if (currentTime - lastPressTime > debounceDelay) {
+  if (btn::accept(millis(), lastPressL, debounceDelay, digitalRead(PIN_BTN_L) == LOW)) {
     ChangeRequested = true;
-    lastPressTime = currentTime;
   }
 }
 
 void IRAM_ATTR handleButton1() {
-  unsigned long currentTime = millis();
-  if (currentTime - lastPressTime > debounceDelay) {
+  if (btn::accept(millis(), lastPressR, debounceDelay, digitalRead(PIN_BTN_R) == LOW)) {
     ChangeRequested1 = true;
-    lastPressTime = currentTime;
   }
 }
 
 void IRAM_ATTR handleButton2() {
-  unsigned long currentTime = millis();
-  if (currentTime - lastPressTime > debounceDelay) {
+  if (btn::accept(millis(), lastPressS, debounceDelay, digitalRead(PIN_BTN_S) == LOW)) {
     // FEATURE (2026-11-19): the center button is now context-aware:
     //   - while the screensaver is showing -> any press WAKES it
     //   - on the Screensaver card          -> press STARTS the animation
@@ -43,7 +48,6 @@ void IRAM_ATTR handleButton2() {
     } else {
       current = DEACTIVE_MODE;
     }
-    lastPressTime = currentTime;
   }
 }
 
@@ -91,6 +95,14 @@ static const uint8_t PAD      = 6;
 static const uint8_t CARD_H   = 36;
 static const uint8_t RADIUS   = 3;
 static const uint8_t DOT_Y    = 64 - 6;
+
+// HEARTBEAT (2026-11-19, battery UI-lock diagnostics): this notch in the
+// header blinks once a second while the main loop is running. If the device
+// ever "locks up" again, LOOK AT IT: blinking notch = the loop is alive and
+// the problem is input handling; frozen notch = the loop is genuinely hung
+// (and the 10 s watchdog should then reboot the board — splash replay).
+// The same tick prints an "HB" line over serial for cable-attached sessions.
+static bool heartbeatOn = false;
 
 static const char* kMenuLabels[] = {
   "WiFi", "Video TX", "RC", "BLE", "Bluetooth", "USB Wireless", "Zigbee", "NRF24",
@@ -192,6 +204,9 @@ static void drawHeaderBar() {
   const char* ver = "v2.0.0";
   int vw = u8g2.getStrWidth(ver);
   u8g2.drawStr(W - vw - 4, TXT_Y, ver);
+  // HEARTBEAT (2026-11-19): blinking notch in the middle of the header —
+  // visible proof the main loop is turning (see heartbeatOn above).
+  if (heartbeatOn) u8g2.drawBox(63, 4, 2, 4);
   u8g2.setDrawColor(1);
   u8g2.drawHLine(0, H - 1, W);
 }
@@ -561,6 +576,27 @@ void loop() {
       lastActivity = current;
       return;
     }
+  }
+
+  // ---- HEARTBEAT (2026-11-19): blink the header notch once a second and
+  // report over serial. Placed AFTER the nav/toggle branches above (those
+  // `return` early on the pass where they act) so it never fights an
+  // animation for the frame. Runs in every state except the screensaver
+  // (there, the animation itself proves the loop is alive).
+  static unsigned long lastHeartbeatMs = 0;
+  if (!screensaverActive && millis() - lastHeartbeatMs >= 1000) {
+    lastHeartbeatMs = millis();
+    heartbeatOn = !heartbeatOn;
+    renderStaticMenu(menuIndexFromMode(current_Mode));
+    // One-line status dump: for future data-only-cable debugging sessions.
+    Serial.print("HB ms=");
+    Serial.print(lastHeartbeatMs);
+    Serial.print(" armed=");
+    Serial.print(current == ACTIVE_MODE ? 1 : 0);
+    Serial.print(" focus=");
+    Serial.print(menuIndexFromMode(current_Mode));
+    Serial.print(" target=");
+    Serial.println(menuIndexFromMode(armedMode));
   }
 
   // ---- Status LED (2026-11-19): green while jamming, blue while passive,

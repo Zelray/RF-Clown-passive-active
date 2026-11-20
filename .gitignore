@@ -1,6 +1,9 @@
 # Local build tools (arduino-cli + toolchains — hundreds of MB, not source)
 .tools/
 
+# Local compile output dirs (firmware + test sketch binaries)
+.build/
+
 # Local test evidence logs (kept on disk, kept out of the repo)
 jam-test-*.txt
 

@@ -125,7 +125,16 @@ extern OperationMode armedMode;           // FROZEN TARGET: the mode focused at 
                                           // never retargets a live transmitter.
 extern bool ledEnabled;                   // user's LED preference (persisted EEPROM)
 
-extern unsigned long lastPressTime;
-const unsigned long debounceDelay = 200;
+// BUTTON FIX (2026-11-19, battery UI-lock bug): the three buttons used to
+// share ONE "lastPressTime" clock. RF noise from the transmitting radios
+// spiked the button lines and refreshed that shared clock, so real presses
+// were always rejected as "too soon" — all buttons dead until power-pull.
+// Now each button keeps its OWN clock (see menu_logic.h, namespace btn).
+extern volatile unsigned long lastPressL;   // LEFT (GPIO27)  own debounce clock
+extern volatile unsigned long lastPressR;   // RIGHT (GPIO25) own debounce clock
+extern volatile unsigned long lastPressS;   // CENTER (GPIO26) own debounce clock
+// Debounce window, slightly lengthened 200 -> 250 ms: still snappy for card
+// browsing, more forgiving of contact bounce on the battery rail.
+const unsigned long debounceDelay = 250;
 
 #endif // CONFIG_H

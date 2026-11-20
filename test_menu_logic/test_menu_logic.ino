@@ -70,6 +70,35 @@ void setup() {
   // an input or output of any function in menu_logic.h. (Wiring assertion:
   // checkMode() must keep calling only these when a nav button fires.)
 
+  // --- Spec 5 (battery UI-lock fix, 2026-11-19): each button has its OWN
+  // debounce clock, and a press only counts if the pin is STILL low when
+  // the handler runs. This is what was supposed to happen on the battery-
+  // armed lock: RF noise spikes the lines, ghost edges must be rejected
+  // WITHOUT starving a real, held press on any button.
+  {
+    unsigned long clockL = 0, clockR = 0;         // two buttons' own clocks
+    const unsigned long D = 250;                  // debounce window under test
+
+    check("accepts a real press when the pin is held low",
+          btn::accept(10000, clockL, D, true));
+    check("rejects a repeat press inside the debounce window",
+          !btn::accept(10100, clockL, D, true));
+    check("accepts again once the window has passed",
+          btn::accept(10300, clockL, D, true));
+    check("rejects a ghost edge (pin NOT still low)",
+          !btn::accept(11000, clockL, D, false));
+    check("a rejected ghost edge does not advance the clock",
+          btn::accept(11000, clockL, D, true));
+    check("one button's noise never starves another button (own clocks)",
+          btn::accept(10000, clockR, D, true) && !btn::accept(10100, clockR, D, true));
+    // The shared-clock bug itself, expressed as a test: under the OLD rule a
+    // spike at t=10400 (say on the RIGHT line) would block a REAL LEFT press
+    // at t=10500. Under the new rule the LEFT clock only knows its OWN past.
+    check("a spike on one line cannot block a real press on another",
+          btn::accept(10400, clockR, D, true) == true &&   // right "press" (noise)
+          btn::accept(10500, clockL, D, true) == true);    // left press still lands
+  }
+
   Serial.println("------------------------------");
   Serial.print(failures == 0 ? "ALL TESTS PASSED" : "TESTS FAILED: ");
   if (failures > 0) Serial.println(failures);

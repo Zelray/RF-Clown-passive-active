@@ -44,7 +44,12 @@ OperationMode lastJamMode        = WiFi_MODULE;
 OperationMode armedMode          = WiFi_MODULE;  // frozen jam target (see config.h)
 bool ledEnabled                  = true;
 
-unsigned long lastPressTime = 0;  // for debouncing the buttons
+// BUTTON FIX (2026-11-19): one debounce clock PER BUTTON (used to be one
+// shared clock — RF noise on any button line starved all three; see
+// menu_logic.h namespace btn for the full story).
+volatile unsigned long lastPressL = 0;
+volatile unsigned long lastPressR = 0;
+volatile unsigned long lastPressS = 0;
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------

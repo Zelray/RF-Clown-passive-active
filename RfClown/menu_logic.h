@@ -49,3 +49,46 @@ inline const char* statusForCard(bool armed, int cardIdx, int armedTargetIdx) {
 }
 
 }  // namespace menu
+
+// ============================================================================
+// namespace btn — BUTTON PRESS ACCEPTANCE RULE (added 2026-11-19, battery
+// UI-lock fix). Pure function so the on-device test suite can verify it.
+//
+// THE BUG IT FIXES: all three button interrupts used to share ONE debounce
+// clock ("lastPressTime"). When the radios transmit at max power, they induce
+// stray voltage spikes on the button traces; every spike — on ANY of the
+// three lines — refreshed that shared clock, so a REAL press always looked
+// like "too soon after the last one" and was thrown away. On battery (weak
+// ~3.4V rail, internal pull-ups only, no filter caps on the v2 board) the
+// spikes are frequent enough to starve all three buttons permanently: the
+// jamming keeps running, the screen stays normal, but every press is ignored
+// until power is pulled. No watchdog reboot happens because the code never
+// hangs — it just rejects the input. (Exactly what the owner observed live.)
+//
+// THE RULE: a press is accepted only if
+//   1. the pin is STILL low when the handler runs (a finger holds the line
+//      down for 100+ ms; an RF-induced ghost spike is over in microseconds),
+//   AND 2. this button's OWN clock says enough time passed since this
+//      button's last accepted press (mechanical contact bounce guard).
+// Each button keeps its own clock, so noise on one line can never starve
+// another button.
+// ============================================================================
+namespace btn {
+
+// now          = millis() at the moment of the interrupt
+// lastPressMs  = this button's OWN last-accepted-press time (updated on accept;
+//                declared volatile because interrupt handlers own it)
+// debounceMs   = minimum spacing between accepted presses of this button
+// pinStillLow  = true if the button line reads LOW right now (i.e. held)
+// Returns true (and advances the clock) only for an accepted press.
+inline bool accept(unsigned long now,
+                   volatile unsigned long& lastPressMs,
+                   unsigned long debounceMs,
+                   bool pinStillLow) {
+  if (!pinStillLow) return false;              // ghost spike: gone already -> reject, clock untouched
+  if (now - lastPressMs < debounceMs) return false;  // too soon after this button's last press
+  lastPressMs = now;                           // accepted: advance THIS button's clock
+  return true;
+}
+
+}  // namespace btn

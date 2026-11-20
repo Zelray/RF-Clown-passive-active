@@ -10,6 +10,58 @@ RF24 RadioA(NRF_CE_PIN_A, NRF_CSN_PIN_A);
 RF24 RadioB(NRF_CE_PIN_B, NRF_CSN_PIN_B);
 RF24 RadioC(NRF_CE_PIN_C, NRF_CSN_PIN_C);
 
+// ---------------------------------------------------------------------------
+// FIX (2026-11-19): single home for all shared variables.
+// These used to be created inside config.h / setting.h, so every source file
+// got its own copy and the linker failed with "multiple definition" errors.
+// The headers now only *announce* them (extern); this block is the one copy.
+// ---------------------------------------------------------------------------
+bool neoPixelActive = false;       // saved LED preference, loaded from EEPROM
+uint8_t oledBrightness = 100;      // screen brightness setting (0-255 scale)
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+Adafruit_NeoPixel pixels(1, 14, NEO_GRB + NEO_KHZ800);  // one LED on GPIO 14
+
+OperationMode current_Mode = WiFi_MODULE;  // which of the 8 modes is selected
+volatile Operation current = DEACTIVE_MODE; // jamming OFF until the user toggles it
+
+// Channel lists each radio sweeps when all three run together.
+byte channelGroup_1[] = {2, 5, 8, 11};
+byte channelGroup_2[] = {26, 29, 32, 35};
+byte channelGroup_3[] = {80, 83, 86, 89};
+
+// Button flags set by interrupts in RfClown.ino, read in the main loop.
+volatile bool ChangeRequested  = false;
+volatile bool ChangeRequested1 = false;
+volatile bool ChangeRequested2 = false;
+
+// Screensaver + LED card state (2026-11-19) — see config.h for the story.
+volatile bool screensaverActive  = false;
+volatile bool enterScreensaver   = false;
+volatile bool wakeRequested      = false;
+volatile bool toggleLedRequested = false;
+OperationMode lastJamMode        = WiFi_MODULE;
+bool ledEnabled                  = true;
+
+unsigned long lastPressTime = 0;  // for debouncing the buttons
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// BATTERY FIX (2026-11-19): setup() used to call initialize_MultiMode() as
+// its very first act — firing ALL THREE radios into max-power constant
+// carriers, then powering them back down if passive. That boot spike collapses
+// the battery rail (the v2 power design leaves only ~3.3-3.6 V there on
+// battery — see BUILD-FIX-NOTES.md), causing brownout resets at boot and on
+// every activation (matches GitHub issue #31, "freezes on battery"). This
+// gentle start configures each radio and immediately parks it powered-down:
+// no transmission, no spike.
+// ---------------------------------------------------------------------------
+void radioQuietStart() {
+  RadioA.begin();  RadioA.powerDown();  digitalWrite(NRF_CE_PIN_A, LOW);
+  RadioB.begin();  RadioB.powerDown();  digitalWrite(NRF_CE_PIN_B, LOW);
+  RadioC.begin();  RadioC.powerDown();  digitalWrite(NRF_CE_PIN_C, LOW);
+}
+
 void setRadiosNeutralState() {
   RadioA.stopListening();
   RadioA.setAutoAck(false);

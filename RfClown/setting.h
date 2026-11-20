@@ -18,16 +18,23 @@
 void neopixelSetup();
 void neopixelLoop();
 
+// LED control (2026-11-19): setup + apply-to-state + persist preference.
+void ledApply();               // dark if disabled; green when jamming, blue passive
+void ledSavePreference();      // write ledEnabled to EEPROM
+
 void setNeoPixelColour(const std::string& colour);
 void flash(int numberOfFlashes, const std::vector<std::string>& colors, const std::string& finalColour);
 
 extern U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2;
 extern Adafruit_NeoPixel pixels;
 
-//extern bool neoPixelActive;
-
-bool neoPixelActive = false;
-uint8_t oledBrightness = 100;
+// SHARED SETTINGS — FIX (2026-11-19): these used to be *created* here in the
+// header, which made every source file that includes this header build its own
+// copy. The linker then failed with "multiple definition" errors. Now the
+// header only ANNOUNCES them ("extern" = "this variable exists, defined
+// elsewhere"), and the single real copy lives in setting.cpp.
+extern bool neoPixelActive;
+extern uint8_t oledBrightness;
 
 extern RF24 RadioA;
 extern RF24 RadioB;
@@ -36,6 +43,10 @@ extern RF24 RadioC;
 void configureNrf(RF24 &radio);
 
 void setRadiosNeutralState();
+
+// BATTERY FIX (2026-11-19): gentle radio bring-up at boot — no carriers.
+// See setting.cpp for the brownout story.
+void radioQuietStart();
 
 void setupRadioA();
 void setupRadioB();

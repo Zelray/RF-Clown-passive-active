@@ -5,6 +5,7 @@
    
 #include "setting.h"
 #include "config.h"
+#include <esp_task_wdt.h>   // FREEZE FIX (2026-11-19) — see setup()
 
 void IRAM_ATTR handleButton() {
   unsigned long currentTime = millis();
@@ -25,8 +26,22 @@ void IRAM_ATTR handleButton1() {
 void IRAM_ATTR handleButton2() {
   unsigned long currentTime = millis();
   if (currentTime - lastPressTime > debounceDelay) {
-    if (current == DEACTIVE_MODE) current = ACTIVE_MODE;
-    else                          current = DEACTIVE_MODE;
+    // FEATURE (2026-11-19): the center button is now context-aware:
+    //   - while the screensaver is showing -> any press WAKES it
+    //   - on the Screensaver card          -> press STARTS the animation
+    //   - on the LED card                  -> press toggles the LED on/off
+    //   - on any jamming card              -> press arms/disarms as before
+    if (screensaverActive) {
+      wakeRequested = true;
+    } else if (current_Mode == SCREENSAVER_MODULE) {
+      enterScreensaver = true;
+    } else if (current_Mode == LED_MODULE) {
+      toggleLedRequested = true;
+    } else if (current == DEACTIVE_MODE) {
+      current = ACTIVE_MODE;
+    } else {
+      current = DEACTIVE_MODE;
+    }
     lastPressTime = currentTime;
   }
 }
@@ -41,14 +56,21 @@ void configure_Radio(RF24 &radio, const byte *channels, size_t size) {
 }
 
 void initialize_MultiMode() {
+  // BATTERY FIX (2026-11-19): the three radios used to slam into max-power
+  // carriers SIMULTANEOUSLY. On battery the v2 power rail can't take that
+  // step-load and the chip browns out (looks like "the button did nothing").
+  // Now each radio gets a 150 ms settle window before the next one arms.
   if (RadioA.begin()) {
     configure_Radio(RadioA, channelGroup_1, sizeof(channelGroup_1));
+    delay(150);
   }
   if (RadioB.begin()) {
     configure_Radio(RadioB, channelGroup_2, sizeof(channelGroup_2));
+    delay(150);
   }
   if (RadioC.begin()) {
     configure_Radio(RadioC, channelGroup_3, sizeof(channelGroup_3));
+    delay(150);
   }
 }
 
@@ -70,7 +92,8 @@ static const uint8_t RADIUS   = 3;
 static const uint8_t DOT_Y    = 64 - 6;
 
 static const char* kMenuLabels[] = {
-  "WiFi", "Video TX", "RC", "BLE", "Bluetooth", "USB Wireless", "Zigbee", "NRF24"
+  "WiFi", "Video TX", "RC", "BLE", "Bluetooth", "USB Wireless", "Zigbee", "NRF24",
+  "Screensaver", "LED"
 };
 static const int kMenuCount = sizeof(kMenuLabels)/sizeof(kMenuLabels[0]);
 
@@ -84,6 +107,8 @@ static int menuIndexFromMode(OperationMode m) {
     case USB_WIRELESS_MODULE: return 5;
     case ZIGBEE_MODULE:       return 6;
     case NRF24_MODULE:        return 7;
+    case SCREENSAVER_MODULE:  return 8;
+    case LED_MODULE:          return 9;
     default: return 0;
   }
 }
@@ -97,6 +122,8 @@ static OperationMode modeFromMenuIndex(int idx) {
     case 5: return USB_WIRELESS_MODULE;
     case 6: return ZIGBEE_MODULE;
     case 7: return NRF24_MODULE;
+    case 8: return SCREENSAVER_MODULE;
+    case 9: return LED_MODULE;
     default: return WiFi_MODULE;
   }
 }
@@ -174,8 +201,20 @@ static void drawPillKnob(int x,int y,int w,int h,float pos){
   u8g2.drawDisc(cx, cy, knob);
 }
 static void drawPillToggle(int x,int y,int w,int h,bool on){
+  // UX FIX (2026-11-19): knob now sits on the RIGHT when ON (standard toggle
+  // convention — it used to slide left, which read backwards), and the pill
+  // body FILLS when ON. The OLED is monochrome (no green available), so a
+  // filled pill is the strongest "this is on" signal the screen can draw.
   drawPillOutline(x,y,w,h);
-  drawPillKnob(x,y,w,h, on?0.0f:1.0f);
+  if (on) {
+    if (h & 1) h--; if (y & 1) y--;
+    u8g2.drawRBox(x, y, w, h, h/2);   // solid pill = jamming engaged
+    u8g2.setDrawColor(0);             // punch the knob out as a hole
+    drawPillKnob(x, y, w, h, 1.0f);   // knob on the right = ON
+    u8g2.setDrawColor(1);
+  } else {
+    drawPillKnob(x, y, w, h, 0.0f);   // outline pill, knob left = OFF
+  }
 }
 
 static void drawPaginationDots(int active){
@@ -201,13 +240,27 @@ static void drawCardAtCenter(int centerX, int menuIndex){
   u8g2.setFont(FONT_MEDIUM);
   u8g2.setCursor(x + 12, y + 4);
   u8g2.print(label);
-  bool isThisFocus = (modeFromMenuIndex(menuIndex) == current_Mode);
-  bool isActive    = (isThisFocus && current == ACTIVE_MODE);
-  const char* status = isActive ? "ACTIVE" : "DEACTIVE";
+  OperationMode cardMode = modeFromMenuIndex(menuIndex);
+  bool isThisFocus = (cardMode == current_Mode);
+  // UX FIX (2026-11-19): clearer words — "PASSIVE" / "JAMMING" instead of
+  // "DEACTIVE" / "ACTIVE". The two settings cards show their OWN state
+  // instead of the jam state, so the pill always means "this card's thing".
+  const char* status;
+  bool isOn;
+  if (cardMode == SCREENSAVER_MODULE) {
+    status = screensaverActive ? "RUNNING" : "READY";
+    isOn   = screensaverActive;
+  } else if (cardMode == LED_MODULE) {
+    status = ledEnabled ? "ON" : "OFF";
+    isOn   = ledEnabled;
+  } else {
+    bool isActive = (isThisFocus && current == ACTIVE_MODE);
+    status = isActive ? "JAMMING" : "PASSIVE";
+    isOn   = isActive;
+  }
   u8g2.setFont(FONT_SMALL);
   u8g2.setCursor(x + 12, y + 16);
   u8g2.print(status);
-  bool isOn = (modeFromMenuIndex(menuIndex) == current_Mode) && (current == ACTIVE_MODE);
   const int pillW=24, pillH=14;
   const int pillY=(y + ((CARD_H-pillH)/2)) & ~1;
   drawPillToggle(x + w - pillW - 10, pillY, pillW, pillH, isOn);
@@ -244,8 +297,10 @@ static void animateToMenu(int fromIdx, int toIdx) {
 }
 
 static void animateToggleKnobForFocus(int focusIdx, bool fromActive, bool toActive){
-  float start = (fromActive ? 0.0f : 1.0f);
-  float end   = (toActive   ? 0.0f : 1.0f);
+  // UX FIX (2026-11-19): animation endpoints flipped to match the corrected
+  // toggle convention — knob travels toward the RIGHT when turning on.
+  float start = (fromActive ? 1.0f : 0.0f);
+  float end   = (toActive   ? 1.0f : 0.0f);
   const int STEPS = 10;
   const uint8_t FRAME_MS = 12;
   for (int s=0; s<=STEPS; s++){
@@ -276,6 +331,61 @@ static void animateToggleKnobForFocus(int focusIdx, bool fromActive, bool toActi
   renderStaticMenu(focusIdx);
 }
 
+// ---------------------------------------------------------------------------
+// Screensaver + channel-hopping helpers (added 2026-11-19)
+// ---------------------------------------------------------------------------
+// Which animation is currently on screen: false = matrix rain, true = bars.
+bool animPhase = false;
+unsigned long lastAnimSwitch = 0;
+
+// Menu-state trackers. These used to be locals inside loop(); they moved out
+// so the screensaver wake path can re-sync them (otherwise waking after a
+// mode change behind the animation triggered a spurious slide).
+static Operation     lastActivity = DEACTIVE_MODE;
+static OperationMode lastFocus    = WiFi_MODULE;
+
+// Pick a random channel from the given mode's list. Refactor of the old
+// 8-way if-chain from loop(), so the Screensaver/LED cards can keep the
+// LAST real jamming mode hopping while focus sits on a settings card.
+byte randomChannelFor(OperationMode m) {
+  const byte* list;
+  size_t count;
+  switch (m) {
+    case BLE_MODULE:          list = ble_channels;              count = sizeof(ble_channels);              break;
+    case Bluetooth_MODULE:    list = bluetooth_channels;        count = sizeof(bluetooth_channels);        break;
+    case USB_WIRELESS_MODULE: list = usbWireless_channels;      count = sizeof(usbWireless_channels);      break;
+    case VIDEO_TX_MODULE:     list = videoTransmitter_channels; count = sizeof(videoTransmitter_channels); break;
+    case RC_MODULE:           list = rc_channels;               count = sizeof(rc_channels);               break;
+    case ZIGBEE_MODULE:       list = zigbee_channels;           count = sizeof(zigbee_channels);           break;
+    case NRF24_MODULE:        list = nrf24_channels;            count = sizeof(nrf24_channels);            break;
+    case WiFi_MODULE:
+    default:                  list = WiFi_channels;             count = sizeof(WiFi_channels);             break;
+  }
+  return list[random(0, count / sizeof(byte))];
+}
+
+// "Digital rain" screensaver frame — bright dashes falling at different
+// speeds. Pure decoration on a monochrome screen; sends no RF data.
+static void matrixRain() {
+  const int COLS = 42;  // 128 px wide / 3 px per column
+  static int  y[COLS];
+  static int  spd[COLS];
+  static bool seeded = false;
+  if (!seeded) {
+    for (int i = 0; i < COLS; i++) { y[i] = random(-64, 64); spd[i] = random(2, 6); }
+    seeded = true;
+  }
+  u8g2.clearBuffer();
+  for (int i = 0; i < COLS; i++) {
+    y[i] += spd[i];
+    if (y[i] > SCREEN_H + 6) { y[i] = -random(0, 40); spd[i] = random(2, 6); }
+    int head = y[i];
+    u8g2.drawBox(i * 3, constrain(head - 4, 0, SCREEN_H - 4), 1, 4);  // bright dash
+    if (head - 8 > 0) u8g2.drawPixel(i * 3, head - 8);                // trailing dot
+  }
+  u8g2.sendBuffer();
+}
+
 void update_OLED() {
   int focus = menuIndexFromMode(current_Mode);
   renderStaticMenu(focus);
@@ -285,12 +395,20 @@ void menuPrev() {
   int fromIdx = menuIndexFromMode(current_Mode);
   int toIdx   = (fromIdx == 0) ? (kMenuCount - 1) : (fromIdx - 1);
   current_Mode = modeFromMenuIndex(toIdx);
+  // Keep the "last real jamming mode" fresh when landing on a mode card
+  // (settings cards must NOT overwrite it).
+  if (current_Mode != SCREENSAVER_MODULE && current_Mode != LED_MODULE) {
+    lastJamMode = current_Mode;
+  }
   animateToMenu(fromIdx, toIdx);
 }
 void menuNext() {
   int fromIdx = menuIndexFromMode(current_Mode);
   int toIdx   = (fromIdx == (kMenuCount - 1)) ? 0 : (fromIdx + 1);
   current_Mode = modeFromMenuIndex(toIdx);
+  if (current_Mode != SCREENSAVER_MODULE && current_Mode != LED_MODULE) {
+    lastJamMode = current_Mode;
+  }
   animateToMenu(fromIdx, toIdx);
 }
 void menuToggleActive() {
@@ -301,22 +419,53 @@ void menuToggleActive() {
 }
 
 void checkMode() {
+  // UX FIX (2026-11-19): direction was inverted — the right-hand button
+  // stepped to the PREVIOUS mode and the left-hand button stepped forward.
+  // Swapped so the controls read the way every other carousel does:
+  // left = back, right = forward. (Wrap updated for the 10-card menu.)
   if (ChangeRequested) {
     ChangeRequested = false;
-    current_Mode = static_cast<OperationMode>((current_Mode == 0) ? 7 : (current_Mode - 1));
+    current_Mode = static_cast<OperationMode>((current_Mode + 1) % 10);
   } else if (ChangeRequested1) {
     ChangeRequested1 = false;
-    current_Mode = static_cast<OperationMode>((current_Mode + 1) % 8);
+    current_Mode = static_cast<OperationMode>((current_Mode == 0) ? 9 : (current_Mode - 1));
+  }
+  // Remember the last REAL jamming mode, so the Screensaver and LED settings
+  // cards can keep it running while focus sits on them.
+  if (current_Mode != SCREENSAVER_MODULE && current_Mode != LED_MODULE) {
+    lastJamMode = current_Mode;
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  initialize_MultiMode();
+  // BATTERY FIX (2026-11-19): setup() used to fire ALL THREE radios into
+  // max-power carriers as its very first act (initialize_MultiMode), then
+  // power them down again if passive. On battery that boot spike collapses
+  // the rail -> brownout reset loop (GitHub issue #31). Quiet start instead.
+  radioQuietStart();
+  // LED FIX (2026-11-19): force the WS2812 DARK immediately. It used to be
+  // left uninitialized, latched random garbage, and sat blinding-white while
+  // draining ~60mA the whole time. Also loads the saved LED preference.
+  neopixelSetup();
+  // FREEZE FIX (2026-11-19), part 1: the OLED bus runs at the I2C standard's
+  // full 100 kHz instead of 400 kHz. At 400 kHz the data windows are 4x
+  // shorter, so the rail dip that happens when the radios arm can glitch a
+  // transaction; the Wire library in ESP32 core 1.0.5 has NO timeout, and a
+  // glitched transaction used to hang the firmware forever (frozen screen,
+  // dead buttons, and the radios possibly still transmitting — GitHub #31).
   Wire.begin();
-  Wire.setClock(400000);
+  Wire.setClock(100000);
   u8g2.begin();
-  u8g2.setBusClock(400000);
+  u8g2.setBusClock(100000);
+
+  // FREEZE FIX (2026-11-19), part 2: a 10-second watchdog on the main loop.
+  // If anything hangs the loop (I2C wait, SPI stall), the chip resets itself
+  // and comes back to a SAFE PASSIVE MENU instead of freezing forever —
+  // crucially, this also stops a "jammed silently while the screen says
+  // PASSIVE" state (the owner caught the device doing exactly that).
+  esp_task_wdt_init(10, true);
+  esp_task_wdt_add(NULL);   // watch the loop task
   u8g2.setFont(FONT_SMALL);
   u8g2.setDrawColor(1);
   u8g2.setFontPosTop();
@@ -336,72 +485,85 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();   // "still alive" pat for the 10 s watchdog
   checkMode();
-  static Operation     lastActivity = current;
-  static OperationMode lastFocus    = current_Mode;
-  if (current_Mode != lastFocus) {
-    int fromIdx = menuIndexFromMode(lastFocus);
-    int toIdx   = menuIndexFromMode(current_Mode);
-    animateToMenu(fromIdx, toIdx);
-    lastFocus = current_Mode;
-    return;
-  }
-  if (current != lastActivity) {
-    initialize_Radios();
-    int  focus     = menuIndexFromMode(current_Mode);
-    bool wasActive = (lastActivity == ACTIVE_MODE);
-    bool nowActive = (current      == ACTIVE_MODE);
-    animateToggleKnobForFocus(focus, wasActive, nowActive);
+
+  // ---- Settings-card actions (flags come from the center-button ISR) ----
+  if (wakeRequested) {            // any press while screensaver runs: wake
+    wakeRequested = false;
+    screensaverActive = false;
+    lastFocus    = current_Mode;  // re-sync so no phantom slide plays on wake
     lastActivity = current;
-    return;
+    update_OLED();
   }
-    if (current_Mode == BLE_MODULE) {
-      int randomIndex = random(0, sizeof(ble_channels) / sizeof(ble_channels[0]));
-      byte channel = ble_channels[randomIndex];
-      RadioA.setChannel(channel);
-      RadioB.setChannel(channel);
-      RadioC.setChannel(channel);
-    } else if (current_Mode == Bluetooth_MODULE) {
-      int randomIndex = random(0, sizeof(bluetooth_channels) / sizeof(bluetooth_channels[0]));
-      byte channel = bluetooth_channels[randomIndex];
-      RadioA.setChannel(channel);
-      RadioB.setChannel(channel);
-      RadioC.setChannel(channel);
-    } else if (current_Mode == WiFi_MODULE) {
-      int randomIndex = random(0, sizeof(WiFi_channels) / sizeof(WiFi_channels[0]));
-      byte channel = WiFi_channels[randomIndex];
-      RadioA.setChannel(channel);
-      RadioB.setChannel(channel);
-      RadioC.setChannel(channel);
-    } else if (current_Mode == USB_WIRELESS_MODULE) {
-      int randomIndex = random(0, sizeof(usbWireless_channels) / sizeof(usbWireless_channels[0]));
-      byte channel = usbWireless_channels[randomIndex];
-      RadioA.setChannel(channel);
-      RadioB.setChannel(channel);
-      RadioC.setChannel(channel);
-    } else if (current_Mode == VIDEO_TX_MODULE) {
-      int randomIndex = random(0, sizeof(videoTransmitter_channels) / sizeof(videoTransmitter_channels[0]));
-      byte channel = videoTransmitter_channels[randomIndex];
-      RadioA.setChannel(channel);
-      RadioB.setChannel(channel);
-      RadioC.setChannel(channel);
-    } else if (current_Mode == RC_MODULE) {
-      int randomIndex = random(0, sizeof(rc_channels) / sizeof(rc_channels[0]));
-      byte channel = rc_channels[randomIndex];
-      RadioA.setChannel(channel);
-      RadioB.setChannel(channel);
-      RadioC.setChannel(channel);
-    } else if (current_Mode == ZIGBEE_MODULE) {
-      int randomIndex = random(0, sizeof(zigbee_channels) / sizeof(zigbee_channels[0]));
-      byte channel = zigbee_channels[randomIndex];
-      RadioA.setChannel(channel);
-      RadioB.setChannel(channel);
-      RadioC.setChannel(channel);
-    } else if (current_Mode == NRF24_MODULE) {
-      int randomIndex = random(0, sizeof(nrf24_channels) / sizeof(nrf24_channels[0]));
-      byte channel = nrf24_channels[randomIndex];
-      RadioA.setChannel(channel);
-      RadioB.setChannel(channel);
-      RadioC.setChannel(channel);
+  if (toggleLedRequested) {       // LED card: flip preference + persist it
+    toggleLedRequested = false;
+    ledEnabled = !ledEnabled;
+    ledSavePreference();
+    ledApply();
+    update_OLED();
+  }
+  if (enterScreensaver) {         // Screensaver card: start the animation
+    enterScreensaver = false;
+    screensaverActive = true;
+    animPhase      = false;       // open with the matrix rain
+    lastAnimSwitch = millis();
+  }
+
+  if (screensaverActive) {
+    // Full-screen animation, alternating rain <-> bars every 5 seconds.
+    // Jamming (if armed) keeps hopping below via lastJamMode.
+    if (millis() - lastAnimSwitch > 5000) {
+      animPhase = !animPhase;
+      lastAnimSwitch = millis();
     }
+    if (animPhase) spectrum(); else matrixRain();
+    delay(30);                    // ~30 fps is plenty for this OLED
+  } else {
+    if (current_Mode != lastFocus) {
+      int fromIdx = menuIndexFromMode(lastFocus);
+      int toIdx   = menuIndexFromMode(current_Mode);
+      animateToMenu(fromIdx, toIdx);
+      lastFocus = current_Mode;
+      return;
+    }
+    if (current != lastActivity) {
+      // ORDER FIX (2026-11-19): draw the toggle animation BEFORE arming the
+      // radios. The interrupt flips the armed flag instantly, and arming used
+      // to run before any drawing — so when the battery rail dipped and the
+      // screen froze mid-toggle, the device could sit there TRANSMITTING at
+      // full power while the screen still showed PASSIVE. Now the UI confirms
+      // first; if arming then hangs or browns out, the watchdog resets the
+      // board to a safe PASSIVE menu.
+      int  focus     = menuIndexFromMode(current_Mode);
+      bool wasActive = (lastActivity == ACTIVE_MODE);
+      bool nowActive = (current      == ACTIVE_MODE);
+      animateToggleKnobForFocus(focus, wasActive, nowActive);
+      initialize_Radios();
+      lastActivity = current;
+      return;
+    }
+  }
+
+  // ---- Status LED (2026-11-19): green while jamming, blue while passive,
+  // fully dark if the user turned the LED card off. Re-sent only on change. ----
+  static bool ledShown    = false;
+  static bool lastLedOn   = false;
+  static bool lastLedJam  = false;
+  if (!ledShown || lastLedOn != ledEnabled || lastLedJam != (current == ACTIVE_MODE)) {
+    ledApply();
+    lastLedOn  = ledEnabled;
+    lastLedJam = (current == ACTIVE_MODE);
+    ledShown   = true;
+  }
+
+  // ---- Channel hopping (radios only emit if jamming is armed) ----
+  // On the Screensaver/LED cards, keep the LAST real mode running.
+  OperationMode jamMode =
+      (current_Mode == SCREENSAVER_MODULE || current_Mode == LED_MODULE)
+          ? lastJamMode : current_Mode;
+  byte channel = randomChannelFor(jamMode);
+  RadioA.setChannel(channel);
+  RadioB.setChannel(channel);
+  RadioC.setChannel(channel);
 }
